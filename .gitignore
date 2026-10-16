@@ -1,0 +1,5 @@
+/headvpn
+/headvpn.exe
+/dist/
+*.test
+*.out

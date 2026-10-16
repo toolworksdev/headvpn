@@ -1,0 +1,25 @@
+name: commits
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  convention:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: PR title (it becomes the squash commit on main) and every commit
+        env:
+          # Through env, never interpolated into the script: a PR title is
+          # attacker-controlled text.
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          mapfile -t subjects < <(git log --format='%s' "$BASE_SHA..$HEAD_SHA")
+          python3 .github/scripts/check_commits.py "$PR_TITLE" "${subjects[@]}"

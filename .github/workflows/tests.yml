@@ -1,0 +1,85 @@
+name: tests
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          # Latest patch release: go.mod states the minimum, CI must not pin an
+          # old toolchain with known standard-library vulnerabilities.
+          go-version: stable
+          check-latest: true
+      - run: go vet ./...
+      - name: go test (race detector where supported)
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then go test ./...; else go test -race ./...; fi
+      - run: go build ./cmd/headvpn
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          # Latest patch release: go.mod states the minimum, CI must not pin an
+          # old toolchain with known standard-library vulnerabilities.
+          go-version: stable
+          check-latest: true
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then echo "::error::files not gofmt-ed:"; echo "$out"; exit 1; fi
+      - name: go mod tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+      - name: staticcheck (linux, darwin, windows)
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@latest
+          for os in linux darwin windows; do echo "== $os"; GOOS=$os "$(go env GOPATH)/bin/staticcheck" ./...; done
+
+  vulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          # Latest patch release: go.mod states the minimum, CI must not pin an
+          # old toolchain with known standard-library vulnerabilities.
+          go-version: stable
+          check-latest: true
+      - run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+  keyring:
+    # The Linux keychain: references go through secret-tool to the Secret
+    # Service. Exercise them against a real gnome-keyring, unlocked with a
+    # throwaway password.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          check-latest: true
+      - run: sudo apt-get update -q && sudo apt-get install -yq gnome-keyring libsecret-tools dbus-x11
+      - name: secret-tool round trip
+        run: |
+          dbus-run-session -- sh -ec '
+            printf ci | gnome-keyring-daemon --unlock --components=secrets >/dev/null
+            HEADVPN_SECRET_SERVICE_TEST=1 go test -count=1 -v -run SecretService ./internal/secret
+          ' | tee keyring.log
+          grep -q -- "--- PASS: TestSecretServiceRoundTrip" keyring.log
