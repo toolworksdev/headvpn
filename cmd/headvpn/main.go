@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 
 	"golang.org/x/term"
@@ -24,6 +25,18 @@ import (
 
 // version is set at build time with -ldflags "-X main.version=...".
 var version = "dev"
+
+// currentVersion is the release version, or the module version when the
+// binary came from `go install ...@vX.Y.Z`.
+func currentVersion() string {
+	if version != "dev" {
+		return version
+	}
+	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" && info.Main.Version != "(devel)" {
+		return info.Main.Version
+	}
+	return version
+}
 
 // Exit codes are part of the contract with callers.
 const (
@@ -74,7 +87,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 	switch cmd {
 	case "version", "--version", "-v":
-		fmt.Fprintln(stdout, "headvpn", version)
+		fmt.Fprintln(stdout, "headvpn", currentVersion())
 		return exitOK
 	case "help", "--help", "-h":
 		fmt.Fprint(stdout, usage)

@@ -84,6 +84,26 @@ Side effects you will notice:
 
 ## Install
 
+Download the archive for your system from
+[Releases](https://github.com/toolworksdev/headvpn/releases) (macOS and Linux,
+arm64 and amd64), check it, and put `headvpn` on your `PATH`:
+
+```sh
+v=0.1.0; f=headvpn_${v}_darwin_arm64.tar.gz
+curl -fsSLO https://github.com/toolworksdev/headvpn/releases/download/v$v/$f
+curl -fsSLO https://github.com/toolworksdev/headvpn/releases/download/v$v/SHA256SUMS
+shasum -a 256 --ignore-missing -c SHA256SUMS      # Linux: sha256sum --ignore-missing -c
+gh attestation verify $f --repo toolworksdev/headvpn  # built by this repo's CI, from which commit
+tar -xzf $f headvpn && install -m 755 headvpn ~/.local/bin/
+```
+
+Every release is built by the `release` workflow from a tag on `main`, and
+carries a signed build provenance attestation. The macOS binaries are not
+notarized: downloaded with `curl` they run as is; downloaded with a browser,
+macOS quarantines them (`xattr -d com.apple.quarantine headvpn`).
+
+Or build it with Go:
+
 ```sh
 go install github.com/toolworksdev/headvpn/cmd/headvpn@latest
 ```
