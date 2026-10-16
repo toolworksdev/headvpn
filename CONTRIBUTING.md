@@ -69,3 +69,13 @@ Run the same check locally: `python3 .github/scripts/check_commits.py "$(git log
 
 Do not open a public issue. Use GitHub's **Report a vulnerability** (Security
 tab → Advisories) so it can be fixed before it is disclosed.
+
+## Releases
+
+Releases are cut by [release-please](https://github.com/googleapis/release-please)
+from the commit messages, which is one more reason they follow Conventional
+Commits. Every push to `main` updates an open release PR (`chore: 🔖 release
+x.y.z`) with the next version and the CHANGELOG: `fix` bumps the patch,
+`feat` the minor version, and while the version is `0.x` a breaking change
+(`!`) bumps the minor too. Merging that PR tags `main`; the same workflow then
+builds the binaries, attests them, and attaches them to the release.

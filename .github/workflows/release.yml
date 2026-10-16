@@ -1,28 +1,60 @@
 name: release
 
-# A tag v* builds the binaries, attests where they were built, and publishes
-# the GitHub release. Only repository admins can create v* tags (ruleset).
+# Every push to main updates a release PR (version + CHANGELOG from the
+# Conventional Commits since the last release). Merging that PR creates the
+# tag and the GitHub release; the publish job then builds the binaries,
+# attests where they were built, and attaches them.
 
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
 
 permissions:
   contents: read
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
-  release:
+  release-please:
+    runs-on: ubuntu-latest
+    outputs:
+      created: ${{ steps.rp.outputs.release_created }}
+      tag: ${{ steps.rp.outputs.tag_name }}
+    steps:
+      # A GitHub App token, not GITHUB_TOKEN: the App is the only non-admin
+      # allowed to create v* tags (ruleset), and a release PR it opens runs CI.
+      # The token is cut down to this repository, contents and pull requests.
+      - id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.TW_CI_APP_ID }}
+          private-key: ${{ secrets.TW_CI_PRIVATE_KEY }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+      - id: rp
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          token: ${{ steps.app.outputs.token }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  publish:
+    needs: release-please
+    if: needs.release-please.outputs.created == 'true'
     runs-on: ubuntu-latest
     permissions:
-      contents: write      # create the release
+      contents: write      # upload the assets
       id-token: write      # sign the provenance attestation
       attestations: write  # store it
     env:
-      TAG: ${{ github.ref_name }}
+      TAG: ${{ needs.release-please.outputs.tag }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0
+          ref: ${{ needs.release-please.outputs.tag }}
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
@@ -30,11 +62,8 @@ jobs:
           check-latest: true
           cache: false
 
-      - name: Tag must point at a commit on main
+      - name: Tag must be a semantic version
         run: |
-          git fetch --no-tags origin main
-          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || {
-            echo "::error::$TAG is not on main"; exit 1; }
           [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || {
             echo "::error::$TAG is not a semantic version"; exit 1; }
 
@@ -60,9 +89,7 @@ jobs:
         with:
           subject-path: "dist/*"
 
-      - name: Publish
+      - name: Attach to the release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" \
-            --verify-tag --title "$TAG" --generate-notes
+        run: gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY"
