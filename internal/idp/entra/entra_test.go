@@ -68,7 +68,7 @@ func (f *fakeEntra) serveIdP(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case "/tenant/saml2":
 		if r.Method != http.MethodPost || r.PostForm.Get("SAMLRequest") != "req" {
-			http.Error(w, "no SAMLRequest", 400)
+			http.Error(w, "no SAMLRequest", http.StatusBadRequest)
 			return
 		}
 		cfgPage(w, map[string]any{"pgid": "ConvergedSignIn", "sFT": "ft1", "sCtx": "c1", "canary": "k", "urlPost": f.idp.URL + "/tenant/login", "sErrorCode": "50058"})

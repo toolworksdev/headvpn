@@ -109,7 +109,7 @@ func (f *fakeAWS) serve(w http.ResponseWriter, r *http.Request) {
 	case oidc + "/authorize":
 		if arc := q.Get("authorization_resumption_context"); arc != "" {
 			if arc != "ARC" {
-				http.Error(w, "bad arc", 400)
+				http.Error(w, "bad arc", http.StatusBadRequest)
 				return
 			}
 			if consented {
@@ -126,7 +126,7 @@ func (f *fakeAWS) serve(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "https://example.awsapps.com/start/?callback_url=x&orchestrator_id=ORCH", http.StatusFound)
 	case portal + "/login":
 		if q.Get("directory_id") != "example" || !strings.Contains(q.Get("redirect_url"), "orchestrator_id=ORCH") {
-			http.Error(w, "bad login", 400)
+			http.Error(w, "bad login", http.StatusBadRequest)
 			return
 		}
 		writeJSON(w, map[string]string{"redirectUrl": "https://" + region + ".signin.aws/platform/d-1/login?workflowStateHandle=W&shouldRedirect=true", "csrfToken": "CSRF"})
@@ -137,7 +137,7 @@ func (f *fakeAWS) serve(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "https://"+region+".signin.aws/platform/saml/acs/1", http.StatusTemporaryRedirect)
 	case region + ".signin.aws/platform/saml/acs/1":
 		if r.PostForm.Get("SAMLResponse") != "RESP" || r.PostForm.Get("RelayState") != "RS" {
-			http.Error(w, "bad assertion", 400)
+			http.Error(w, "bad assertion", http.StatusBadRequest)
 			return
 		}
 		to := f.acsRedir
@@ -147,7 +147,7 @@ func (f *fakeAWS) serve(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, to, http.StatusFound)
 	case portal + "/auth/sso-token":
 		if r.Header.Get("x-amz-sso-csrf-token") != "CSRF" || r.PostForm.Get("authCode") != "WR" || r.PostForm.Get("state") != "ST" || r.PostForm.Get("orgId") != "example" {
-			http.Error(w, "bad sso-token", 400)
+			http.Error(w, "bad sso-token", http.StatusBadRequest)
 			return
 		}
 		writeJSON(w, map[string]any{"token": "TOKEN", "redirectUrl": "https://example.awsapps.com/start/", "errorMessage": nil})
@@ -155,13 +155,13 @@ func (f *fakeAWS) serve(w http.ResponseWriter, r *http.Request) {
 		var b map[string]string
 		_ = json.NewDecoder(r.Body).Decode(&b)
 		if r.Header.Get("x-amz-sso_bearer_token") != "TOKEN" || b["orchestrator_id"] != "ORCH" {
-			http.Error(w, "bad authentication_result", 401)
+			http.Error(w, "bad authentication_result", http.StatusUnauthorized)
 			return
 		}
 		writeJSON(w, map[string]any{"location": "https://" + oidc + "/authorize?authorization_resumption_context=ARC"})
 	case portal + "/session/device":
 		if r.Header.Get("Authorization") != "Bearer TOKEN" {
-			http.Error(w, "no auth", 401)
+			http.Error(w, "no auth", http.StatusUnauthorized)
 			return
 		}
 		writeJSON(w, map[string]string{"token": "USERSESSION"})
@@ -171,7 +171,7 @@ func (f *fakeAWS) serve(w http.ResponseWriter, r *http.Request) {
 		var b map[string]string
 		_ = json.NewDecoder(r.Body).Decode(&b)
 		if b["authorizationResumptionContext"] != "ARC" || b["userSessionId"] != "USERSESSION" {
-			http.Error(w, "bad associate", 400)
+			http.Error(w, "bad associate", http.StatusBadRequest)
 			return
 		}
 		f.mu.Lock()
@@ -179,7 +179,7 @@ func (f *fakeAWS) serve(w http.ResponseWriter, r *http.Request) {
 		f.mu.Unlock()
 		writeJSON(w, map[string]any{})
 	default:
-		http.Error(w, "unexpected "+r.Host+r.URL.Path, 404)
+		http.Error(w, "unexpected "+r.Host+r.URL.Path, http.StatusNotFound)
 	}
 }
 
