@@ -41,6 +41,19 @@ type Login struct {
 
 // Run starts at samlURL and returns the SAML POST form for the VPN client.
 func (l *Login) Run(ctx context.Context, samlURL string) (*saml.PostForm, error) {
+	return l.run(ctx, http.MethodGet, samlURL, nil)
+}
+
+// RunPost starts from an SP's HTTP-POST binding (the SAMLRequest form an SP
+// page auto-posts to the realm) and returns the SAML response form, unposted.
+func (l *Login) RunPost(ctx context.Context, action string, form url.Values) (*saml.PostForm, error) {
+	if form.Get("SAMLRequest") == "" {
+		return nil, errors.New("keycloak: the SP form carries no SAMLRequest")
+	}
+	return l.run(ctx, http.MethodPost, action, form)
+}
+
+func (l *Login) run(ctx context.Context, method, samlURL string, first url.Values) (*saml.PostForm, error) {
 	origin, err := parseOrigin(l.Origin)
 	if err != nil {
 		return nil, err
@@ -69,7 +82,7 @@ func (l *Login) Run(ctx context.Context, samlURL string) (*saml.PostForm, error)
 	}
 	sentPassword, sentOTP := false, false
 
-	page, base, err := fetch(ctx, &guarded, http.MethodGet, samlURL, nil)
+	page, base, err := fetch(ctx, &guarded, method, samlURL, first)
 	if err != nil {
 		return nil, err
 	}

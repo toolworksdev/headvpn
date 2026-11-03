@@ -135,3 +135,39 @@ func TestWritableConfigIsRefused(t *testing.T) {
 		t.Fatalf("err=%v, want a refusal of a group/world-writable config", err)
 	}
 }
+
+const goodSSO = `
+[sso.work]
+idp = "keycloak"
+idp_origin = "https://idp.example.com"
+username = "ana@example.com"
+password = "keychain:headvpn/work.password"
+totp_secret = "keychain:headvpn/work.totp"
+verify_profile = "work-prod"
+login_timeout = "45s"
+`
+
+func TestSSO(t *testing.T) {
+	c, err := Load(write(t, goodSSO))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := c.SSO["work"]
+	if s.Timeout() != 45*time.Second || s.VerifyProfile != "work-prod" || s.AsProfile().IdPOrigin != "https://idp.example.com" {
+		t.Fatalf("%+v", s)
+	}
+	bad := map[string]string{
+		"no idp":             strings.Replace(goodSSO, `idp = "keycloak"`, "", 1),
+		"bad idp":            strings.Replace(goodSSO, `idp = "keycloak"`, `idp = "okta"`, 1),
+		"keycloak no origin": strings.Replace(goodSSO, `idp_origin = "https://idp.example.com"`, "", 1),
+		"no password":        strings.Replace(goodSSO, `password = "keychain:headvpn/work.password"`, "", 1),
+		"entra no code":      strings.Replace(strings.Replace(goodSSO, `"keycloak"`, `"entra"`, 1), `totp_secret = "keychain:headvpn/work.totp"`, "", 1),
+		"both otp":           goodSSO + `otp = "prompt:"` + "\n",
+		"typo":               goodSSO + `verify_profle = "x"` + "\n",
+	}
+	for name, body := range bad {
+		if _, err := Load(write(t, body)); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}

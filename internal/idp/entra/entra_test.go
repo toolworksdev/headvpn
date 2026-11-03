@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -26,6 +27,7 @@ type fakeEntra struct {
 	codes             []string
 	callback          bool
 	redirectElsewhere string
+	samlTo            string // when set, /kmsi answers a SAML response form to this URL
 }
 
 func cfgPage(w http.ResponseWriter, cfg map[string]any) {
@@ -64,6 +66,12 @@ func (f *fakeEntra) serveIdP(w http.ResponseWriter, r *http.Request) {
 		f.mu.Unlock()
 	}
 	switch r.URL.Path {
+	case "/tenant/saml2":
+		if r.Method != http.MethodPost || r.PostForm.Get("SAMLRequest") != "req" {
+			http.Error(w, "no SAMLRequest", 400)
+			return
+		}
+		cfgPage(w, map[string]any{"pgid": "ConvergedSignIn", "sFT": "ft1", "sCtx": "c1", "canary": "k", "urlPost": f.idp.URL + "/tenant/login", "sErrorCode": "50058"})
 	case "/tenant/oauth2/v2.0/authorize":
 		post := f.idp.URL + "/tenant/login"
 		if f.postURL != "" {
@@ -111,6 +119,10 @@ func (f *fakeEntra) serveIdP(w http.ResponseWriter, r *http.Request) {
 	case "/kmsi":
 		if r.PostForm.Get("flowToken") != "ft5" {
 			http.Error(w, "bad kmsi", 400)
+			return
+		}
+		if f.samlTo != "" {
+			fmt.Fprintf(w, `<html><body onload="document.forms[0].submit()"><form method="POST" name="hiddenform" action="%s"><input type="hidden" name="SAMLResponse" value="UkVTUA=="/><input type="hidden" name="RelayState" value="rs"/></form></body></html>`, f.samlTo)
 			return
 		}
 		target := f.vpn.URL + "/callback?code=authcode&state=s"
@@ -232,5 +244,43 @@ func TestReturnThroughAConfiguredRelay(t *testing.T) {
 	l.Relays = []string{relay.URL}
 	if err := l.Run(context.Background(), f.vpn.URL+"/key/request"); err != nil || !relayed || !f.callback {
 		t.Fatalf("err=%v relayed=%v callback=%v", err, relayed, f.callback)
+	}
+}
+
+func TestRunSAMLReturnsTheResponseForm(t *testing.T) {
+	f := newFake(t)
+	f.samlTo = f.vpn.URL + "/platform/saml/acs/1"
+	var n int
+	form, err := f.login("right", code(&n)).RunSAML(context.Background(), f.idp.URL+"/tenant/saml2",
+		url.Values{"SAMLRequest": {"req"}, "RelayState": {"rs"}}, []string{f.vpn.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if form.Action != f.samlTo || form.SAMLResponse != "UkVTUA==" || form.RelayState != "rs" || n != 1 {
+		t.Fatalf("form %+v codes %d", form, n)
+	}
+}
+
+func TestRunSAMLRefusesAResponseForAnotherSP(t *testing.T) {
+	f := newFake(t)
+	f.samlTo = "https://evil.example.net/acs"
+	var n int
+	_, err := f.login("right", code(&n)).RunSAML(context.Background(), f.idp.URL+"/tenant/saml2",
+		url.Values{"SAMLRequest": {"req"}, "RelayState": {"rs"}}, []string{f.vpn.URL})
+	if err == nil || !strings.Contains(err.Error(), "refusing the SAML response") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestRunSAMLStartsOnlyAtTheIdP(t *testing.T) {
+	f := newFake(t)
+	var n int
+	_, err := f.login("right", code(&n)).RunSAML(context.Background(), f.vpn.URL+"/tenant/saml2",
+		url.Values{"SAMLRequest": {"req"}}, []string{f.vpn.URL})
+	if err == nil || !strings.Contains(err.Error(), "refusing to start the sign-in") {
+		t.Fatalf("err = %v", err)
+	}
+	if len(f.passwordsSeenAt) != 0 {
+		t.Fatal("password sent")
 	}
 }

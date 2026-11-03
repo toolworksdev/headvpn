@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/toolworksdev/headvpn/internal/htmlform"
+	"github.com/toolworksdev/headvpn/internal/saml"
 )
 
 // DefaultOrigin is the public-cloud sign-in host.
@@ -113,20 +114,58 @@ type page struct {
 // Run signs in starting at startURL (the URL the VPN client handed out). It
 // returns once Entra redirects back to the VPN server's origin.
 func (l *Login) Run(ctx context.Context, startURL string) error {
+	_, err := l.run(ctx, http.MethodGet, startURL, nil, nil)
+	return err
+}
+
+// RunSAML signs in from an SP's HTTP-POST binding (the SAMLRequest form the
+// SP's page auto-posts to Entra) and returns Entra's SAML response form
+// instead of posting it. acs lists the origins the response may be addressed
+// to; a response for any other origin is refused.
+func (l *Login) RunSAML(ctx context.Context, action string, form url.Values, acs []string) (*saml.PostForm, error) {
+	if form.Get("SAMLRequest") == "" {
+		return nil, errors.New("entra: the SP form carries no SAMLRequest")
+	}
+	if len(acs) == 0 {
+		return nil, errors.New("entra: RunSAML needs the assertion consumer origins")
+	}
+	var to []*url.URL
+	for _, a := range acs {
+		o, err := origin(a, a)
+		if err != nil {
+			return nil, err
+		}
+		to = append(to, o)
+	}
+	return l.run(ctx, http.MethodPost, action, form, to)
+}
+
+// run walks the sign-in. With acs set it stops at the SAML response form;
+// otherwise it posts the result back and returns once it lands on the start
+// URL's origin (the VPN server).
+func (l *Login) run(ctx context.Context, method, startURL string, first url.Values, acs []*url.URL) (*saml.PostForm, error) {
 	idp, err := origin(l.Origin, DefaultOrigin)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	start, err := url.Parse(startURL)
 	if err != nil || start.Scheme != "https" || start.Host == "" {
-		return fmt.Errorf("login URL must be https: %q", redact(startURL))
+		return nil, fmt.Errorf("login URL must be https: %q", redact(startURL))
 	}
 	vpn := &url.URL{Scheme: start.Scheme, Host: start.Host}
+	if acs != nil {
+		// The SAML request goes to the IdP itself; nothing but the IdP is
+		// visited before the response form is handed back.
+		if !same(start, idp) {
+			return nil, fmt.Errorf("refusing to start the sign-in at %s: not %s", start.Host, idp)
+		}
+		vpn = idp
+	}
 	allowed := []*url.URL{idp, vpn}
 	for _, r := range l.Relays {
 		o, err := origin(r, r)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		allowed = append(allowed, o)
 	}
@@ -148,34 +187,48 @@ func (l *Login) Run(ctx context.Context, startURL string) error {
 	}
 	usedCode := false
 
-	p, err := get(ctx, &c, startURL)
+	var p *page
+	if method == http.MethodPost {
+		p, err = post(ctx, &c, startURL, first)
+	} else {
+		p, err = get(ctx, &c, startURL)
+	}
 	if err != nil {
-		return err
+		return nil, err
 	}
 	for i := 0; i < steps; i++ {
 		l.trace(p)
-		if same(p.url, vpn) {
+		if acs == nil && same(p.url, vpn) {
 			if p.status >= 200 && p.status < 400 {
-				return nil
+				return nil, nil
 			}
-			return fmt.Errorf("the VPN server answered HTTP %d after the sign-in", p.status)
+			return nil, fmt.Errorf("the VPN server answered HTTP %d after the sign-in", p.status)
 		}
 		if !same(p.url, idp) {
-			return fmt.Errorf("%w: landed on %s", ErrUnexpectedPage, p.url.Host)
+			return nil, fmt.Errorf("%w: landed on %s", ErrUnexpectedPage, p.url.Host)
+		}
+		if acs != nil {
+			if f, ok := samlResponse(p.html); ok {
+				action, err := p.url.Parse(f.Action)
+				if err != nil || !anySame(action, acs) {
+					return nil, fmt.Errorf("refusing the SAML response: it is addressed to %q, not to the service provider", redact(f.Action))
+				}
+				return &saml.PostForm{Action: action.String(), SAMLResponse: f.Value("SAMLResponse"), RelayState: f.Value("RelayState")}, nil
+			}
 		}
 		if p.cfg == nil {
 			// Plain HTML step: the auto-posting form that hands the result
 			// back to the VPN server.
 			f, ok := autoPost(p.html)
 			if !ok {
-				return fmt.Errorf("%w: no $Config and no form (HTTP %d)", ErrUnexpectedPage, p.status)
+				return nil, fmt.Errorf("%w: no $Config and no form (HTTP %d)", ErrUnexpectedPage, p.status)
 			}
 			action, err := p.url.Parse(f.Action)
 			if err != nil || (!same(action, vpn) && !same(action, idp)) {
-				return fmt.Errorf("%w: form posts to an untrusted origin", ErrUnexpectedPage)
+				return nil, fmt.Errorf("%w: form posts to an untrusted origin", ErrUnexpectedPage)
 			}
 			if p, err = post(ctx, &c, action.String(), f.Values()); err != nil {
-				return err
+				return nil, err
 			}
 			continue
 		}
@@ -188,27 +241,27 @@ func (l *Login) Run(ctx context.Context, startURL string) error {
 		}
 		if cfg.ErrorCode != "" {
 			if why, ok := rejectCodes[cfg.ErrorCode]; ok {
-				return fmt.Errorf("%w: AADSTS%s %s", ErrRejected, cfg.ErrorCode, why)
+				return nil, fmt.Errorf("%w: AADSTS%s %s", ErrRejected, cfg.ErrorCode, why)
 			}
-			return fmt.Errorf("%w: AADSTS%s %s", ErrUnexpectedPage, cfg.ErrorCode, firstLine(cfg.ErrorText))
+			return nil, fmt.Errorf("%w: AADSTS%s %s", ErrUnexpectedPage, cfg.ErrorCode, firstLine(cfg.ErrorText))
 		}
 		switch {
 		case len(cfg.UserProofs) > 0:
 			if usedCode {
-				return fmt.Errorf("%w: asked for a second factor again", ErrUnexpectedPage)
+				return nil, fmt.Errorf("%w: asked for a second factor again", ErrUnexpectedPage)
 			}
 			usedCode = true
 			if p, err = l.secondFactor(ctx, &c, idp, cfg); err != nil {
-				return err
+				return nil, err
 			}
 		case cfg.PageID == "DetectBrowserCapabilities" && cfg.URLResume != "":
 			// Measured: after the password, Entra may stop to let the page's
 			// script probe the browser, then the script loads urlResume.
 			if err := trusted(idp, cfg.URLResume); err != nil {
-				return err
+				return nil, err
 			}
 			if p, err = get(ctx, &c, cfg.URLResume); err != nil {
-				return err
+				return nil, err
 			}
 		case cfg.PageID == "KmsiInterrupt":
 			// "Stay signed in?" — no: nothing here keeps the cookies.
@@ -217,7 +270,7 @@ func (l *Login) Run(ctx context.Context, startURL string) error {
 				"hpgrequestid": {cfg.SessionID}, "flowToken": {cfg.FlowToken},
 				"canary": {cfg.Canary}, "i19": {"1000"},
 			}); err != nil {
-				return err
+				return nil, err
 			}
 		case cfg.URLPost != "" && cfg.FlowToken != "" && (cfg.PageID == "" || cfg.PageID == "ConvergedSignIn" || cfg.PasswordPrompt):
 			if p, err = l.form(ctx, &c, idp, cfg.URLPost, url.Values{
@@ -228,13 +281,13 @@ func (l *Login) Run(ctx context.Context, startURL string) error {
 				"CookieDisabled": {""}, "IsFidoSupported": {"0"}, "isSignupPost": {"0"},
 				"i19": {"1000"},
 			}); err != nil {
-				return err
+				return nil, err
 			}
 		default:
-			return fmt.Errorf("%w: page %q", ErrUnexpectedPage, cfg.PageID)
+			return nil, fmt.Errorf("%w: page %q", ErrUnexpectedPage, cfg.PageID)
 		}
 	}
-	return fmt.Errorf("%w: no result after %d steps", ErrUnexpectedPage, steps)
+	return nil, fmt.Errorf("%w: no result after %d steps", ErrUnexpectedPage, steps)
 }
 
 func (l *Login) trace(p *page) {
@@ -442,6 +495,27 @@ func autoPost(h *htmlform.Page) (htmlform.Form, bool) {
 		}
 	}
 	return htmlform.Form{}, false
+}
+
+func samlResponse(h *htmlform.Page) (htmlform.Form, bool) {
+	if h == nil {
+		return htmlform.Form{}, false
+	}
+	for _, f := range h.Forms {
+		if f.Action != "" && f.Has("SAMLResponse") {
+			return f, true
+		}
+	}
+	return htmlform.Form{}, false
+}
+
+func anySame(u *url.URL, list []*url.URL) bool {
+	for _, o := range list {
+		if same(u, o) {
+			return true
+		}
+	}
+	return false
 }
 
 func origin(s, def string) (*url.URL, error) {

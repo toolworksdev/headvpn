@@ -80,9 +80,70 @@ func (p Profile) Timeout() time.Duration {
 	return 2 * time.Minute
 }
 
+// SSO is one `aws sso login` this tool may answer. The table key is the name
+// of an [sso-session] (or a [profile]) in the AWS CLI config: only the names
+// listed here can be logged in.
+type SSO struct {
+	// IdP: "keycloak" or "entra" — the IdP the IAM Identity Center
+	// directory is federated with (SAML).
+	IdP       string `toml:"idp"`
+	IdPOrigin string `toml:"idp_origin"`
+	Username  string `toml:"username"`
+	// Secret references (keychain:, env:, cmd:, prompt:). Never literal values.
+	Password   string `toml:"password"`
+	TOTPSecret string `toml:"totp_secret"`
+	OTP        string `toml:"otp"`
+	// AWSCLI overrides the path to the aws CLI.
+	AWSCLI string `toml:"aws_cli"`
+	// VerifyProfile is the AWS profile used to check the login with
+	// `sts get-caller-identity`; default: the first profile of the session.
+	VerifyProfile string `toml:"verify_profile"`
+	// LoginTimeout bounds the whole login (default 2m).
+	LoginTimeout duration `toml:"login_timeout"`
+}
+
+// Timeout returns the login timeout or a default.
+func (s SSO) Timeout() time.Duration {
+	if s.LoginTimeout.Duration > 0 {
+		return s.LoginTimeout.Duration
+	}
+	return 2 * time.Minute
+}
+
+// AsProfile exposes the IdP fields with the shape the IdP builders take.
+func (s SSO) AsProfile() Profile {
+	return Profile{IdP: s.IdP, IdPOrigin: s.IdPOrigin, Username: s.Username,
+		Password: s.Password, TOTPSecret: s.TOTPSecret, OTP: s.OTP}
+}
+
+func (s SSO) validate() error {
+	switch s.IdP {
+	case "keycloak":
+		if s.IdPOrigin == "" {
+			return errors.New("keycloak needs idp_origin")
+		}
+	case "entra":
+		if s.TOTPSecret == "" && s.OTP == "" {
+			return errors.New("entra needs totp_secret or otp (only verification codes can be answered)")
+		}
+	case "":
+		return errors.New("idp is required (keycloak or entra)")
+	default:
+		return fmt.Errorf("unknown idp %q", s.IdP)
+	}
+	if s.Username == "" || s.Password == "" {
+		return errors.New("username and password are required")
+	}
+	if s.TOTPSecret != "" && s.OTP != "" {
+		return errors.New("set totp_secret or otp, not both")
+	}
+	return nil
+}
+
 // Config is the whole file.
 type Config struct {
 	Profiles map[string]Profile `toml:"profiles"`
+	SSO      map[string]SSO     `toml:"sso"`
 }
 
 // DefaultPath is $XDG_CONFIG_HOME/headvpn/config.toml or ~/.config/headvpn/config.toml.
@@ -113,6 +174,11 @@ func Load(path string) (*Config, error) {
 	for name, p := range c.Profiles {
 		if err := p.validate(); err != nil {
 			return nil, fmt.Errorf("profile %q: %w", name, err)
+		}
+	}
+	for name, s := range c.SSO {
+		if err := s.validate(); err != nil {
+			return nil, fmt.Errorf("sso %q: %w", name, err)
 		}
 	}
 	return &c, nil

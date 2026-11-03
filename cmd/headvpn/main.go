@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime/debug"
+	"sort"
 	"strings"
 
 	"golang.org/x/term"
@@ -53,6 +54,10 @@ Usage:
   headvpn connect <profile>      [--json] [--config path]
   headvpn status [<profile>]     [--json] [--config path]
   headvpn disconnect <profile>   [--json] [--config path]
+  headvpn sso <name>             [--json] [--config path]
+      runs ` + "`aws sso login`" + ` for the [sso-session] (or [profile]) <name> of
+      ~/.aws/config and answers the browser half; <name> must have an
+      [sso.<name>] table in the config
   headvpn secret set <service>/<account>
   headvpn profiles               [--config path]
   headvpn version
@@ -145,7 +150,41 @@ func run(args []string, stdout, stderr io.Writer) int {
 			p := cfg.Profiles[n]
 			fmt.Fprintf(stdout, "%s\t%s\t%s\n", n, p.Backend, p.IdP)
 		}
+		for _, n := range sortedKeys(cfg.SSO) {
+			fmt.Fprintf(stdout, "%s\taws-sso\t%s\n", n, cfg.SSO[n].IdP)
+		}
 		return exitOK
+	case "sso":
+		if len(pos) != 1 {
+			fmt.Fprintln(stderr, "usage: headvpn sso <name>")
+			return exitUsage
+		}
+		s, ok := cfg.SSO[pos[0]]
+		if !ok {
+			fmt.Fprintf(stderr, "headvpn: no [sso.%s] in %s: only the logins listed there can be answered\n", pos[0], *cfgPath)
+			return exitUsage
+		}
+		r, err := vpn.SSOLogin(ctx, pos[0], s, vpn.SSODeps{Deps: deps})
+		if *asJSON {
+			_ = json.NewEncoder(stdout).Encode(r)
+		} else {
+			line := r.Name + "\t" + r.State
+			if r.Identity != "" {
+				line += "\t" + r.Identity
+			}
+			if r.Error != "" {
+				line += "\terror: " + r.Error
+			}
+			fmt.Fprintln(stdout, line)
+		}
+		switch {
+		case err == nil:
+			return exitOK
+		case vpn.Rejected(err):
+			return exitRejected
+		default:
+			return exitError
+		}
 	case "status":
 		names := pos
 		if len(names) == 0 {
@@ -271,6 +310,15 @@ func promptTTY(label string) (string, error) {
 	b, err := term.ReadPassword(fd)
 	fmt.Fprintln(os.Stderr)
 	return strings.TrimSpace(string(b)), err
+}
+
+func sortedKeys[V any](m map[string]V) []string {
+	var out []string
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func firstOr(s []string, def string) string {

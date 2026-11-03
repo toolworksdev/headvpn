@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -45,17 +46,28 @@ type fakeKC struct {
 	pw, otp       string
 	loginPosts    atomic.Int32
 	otpPosts      atomic.Int32
-	actionOrigin  string // where forms post; defaults to the server itself
-	redirectStart string // when set, the first GET redirects here
+	hits          atomic.Int32 // every request
+	actionOrigin  string       // where forms post; defaults to the server itself
+	redirectStart string       // when set, the first GET redirects here
 }
 
 func (f *fakeKC) handler(self func() string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.hits.Add(1)
 		origin := f.actionOrigin
 		if origin == "" {
 			origin = self()
 		}
 		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/realms/r/protocol/saml":
+			// SP-initiated HTTP-POST binding (AWS IAM Identity Center).
+			_ = r.ParseForm()
+			if r.PostForm.Get("SAMLRequest") != "req" || r.PostForm.Get("RelayState") != "rs-sp" {
+				http.Error(w, "no SAMLRequest", http.StatusBadRequest)
+				return
+			}
+			http.SetCookie(w, &http.Cookie{Name: "AUTH_SESSION_ID", Value: "s1", Path: "/"})
+			fmt.Fprintf(w, loginPage, origin, origin, "")
 		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/realms/r/protocol/saml"):
 			if f.redirectStart != "" {
 				http.Redirect(w, r, f.redirectStart, http.StatusFound)
@@ -211,5 +223,35 @@ func TestOriginMustBeHTTPS(t *testing.T) {
 		if _, err := parseOrigin(bad); err == nil {
 			t.Fatalf("parseOrigin(%q) accepted", bad)
 		}
+	}
+}
+
+func TestRunPostStartsFromTheSPForm(t *testing.T) {
+	f := &fakeKC{pw: "right", otp: "123456"}
+	srv := newServer(t, f)
+	calls := 0
+	form, err := login(srv, "right", &calls).RunPost(context.Background(), srv.URL+"/realms/r/protocol/saml",
+		url.Values{"SAMLRequest": {"req"}, "RelayState": {"rs-sp"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if form.SAMLResponse != "PHNhbWw+" || f.loginPosts.Load() != 1 || f.otpPosts.Load() != 1 {
+		t.Fatalf("form %+v loginPosts=%d otpPosts=%d", form, f.loginPosts.Load(), f.otpPosts.Load())
+	}
+}
+
+func TestRunPostRefusesAnotherOrigin(t *testing.T) {
+	f := &fakeKC{pw: "right", otp: "123456"}
+	srv := newServer(t, f)
+	other := &fakeKC{pw: "right", otp: "123456"}
+	evil := newServer(t, other)
+	calls := 0
+	_, err := login(srv, "right", &calls).RunPost(context.Background(), evil.URL+"/realms/r/protocol/saml",
+		url.Values{"SAMLRequest": {"req"}, "RelayState": {"rs-sp"}})
+	if err == nil || !strings.Contains(err.Error(), "not the trusted IdP origin") {
+		t.Fatalf("err = %v", err)
+	}
+	if other.hits.Load() != 0 {
+		t.Fatalf("the SAML request reached another origin (%d requests)", other.hits.Load())
 	}
 }

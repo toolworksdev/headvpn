@@ -35,6 +35,8 @@ IdP over plain HTTP and hands the assertion to the client's local consumer.
 | Backend `aws-openvpn`: the OpenVPN shipped with AWS VPN Client **5.x for Linux** | implemented |
 | Backend `pritunl`: the official Pritunl client CLI (macOS, Linux) | implemented |
 | IdP `entra`: Microsoft Entra ID, password + TOTP (with `pritunl`) | implemented |
+| `headvpn sso`: answers `aws sso login` (IAM Identity Center federated by SAML) with `keycloak` | implemented, validated on a real portal |
+| `headvpn sso` with `entra` | implemented, tested against a simulated portal and IdP only |
 | Secrets in the macOS Keychain / Linux Secret Service / `env:` / `cmd:` | implemented |
 | Windows | not yet (see *Roadmap*) |
 | Okta | not yet |
@@ -233,12 +235,48 @@ The TOTP secret is the base32 **setup key** of your authenticator (Keycloak:
 *Signing in → Set up authenticator application → Unable to scan?*), not a
 6-digit code.
 
+## AWS SSO login (`aws sso login`)
+
+The same IdP login also answers the browser half of `aws sso login` when the
+IAM Identity Center directory is federated with an external IdP over SAML.
+The name is the one in `~/.aws/config` (`$AWS_CONFIG_FILE`): an
+`[sso-session NAME]`, or a `[profile NAME]` that points at one (or carries the
+legacy `sso_start_url`). Only names with an `[sso.NAME]` table in the
+headvpn config can be logged in:
+
+```toml
+# ~/.aws/config has [sso-session work] with sso_start_url and sso_region
+[sso.work]
+idp            = "keycloak"                       # or "entra"
+idp_origin     = "https://sso.example.com"        # entra: defaults to login.microsoftonline.com
+username       = "ana@example.com"
+password       = "keychain:headvpn/work.password"
+totp_secret    = "keychain:headvpn/work.totp"
+verify_profile = "work-prod"   # optional; default: the first profile of the session
+login_timeout  = "2m"          # optional
+```
+
+```console
+$ headvpn sso work --json
+{"name":"work","state":"LoggedIn","via":"headvpn","verified_with":"work-prod","identity":"arn:aws:sts::111111111111:assumed-role/…/ana@example.com"}
+```
+
+`headvpn sso` runs the official `aws sso login … --no-browser` (authorization
+code with PKCE), reads the authorize URL it prints, and walks the same requests
+the access portal's page makes: portal → sign-in service → the IdP (SAML
+POST binding) → back to the portal → OIDC → the "Allow access" consent →
+the CLI's loopback port. The token cache is written by the CLI itself. Success
+is reported only after `aws sts get-caller-identity` accepts the new
+credentials. The sequence was measured on a real portal, both with a client
+that still needs consent and with one that already has it.
+
 ## Usage and contract for agents
 
 ```
 headvpn connect <profile>    [--json]
 headvpn status [<profile>]   [--json]
 headvpn disconnect <profile> [--json]
+headvpn sso <name>           [--json]
 headvpn profiles
 ```
 
@@ -329,6 +367,13 @@ Read this before you give an agent your VPN.
   password is sent.
 - **The SAML assertion only goes to loopback.** It is a bearer credential; the
   final POST is refused unless its target is `127.0.0.1`/`localhost`.
+- **`headvpn sso` hands out your AWS roles.** Whoever can run it gets every
+  role the identity has in IAM Identity Center, unattended. Only names listed
+  under `[sso.*]` can be logged in. During the login the assertion only goes
+  to the region's AWS sign-in service, every redirect must stay on that
+  login's AWS hosts, consent is given only to the client the CLI registered
+  (same `client_id`), and the code only goes to the CLI's own loopback port
+  with the CLI's `state`.
 
 ## Roadmap
 
@@ -342,7 +387,9 @@ Read this before you give an agent your VPN.
 go test ./...
 ```
 
-Tests run against fake IdPs and a fake client; nothing touches a real VPN.
+Tests run against fake IdPs, a fake client and a fake AWS access portal
+(real host names, routed to a local server); nothing touches a real VPN or
+AWS account.
 
 ## Credits
 
