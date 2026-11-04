@@ -58,6 +58,10 @@ Usage:
       runs ` + "`aws sso login`" + ` for the [sso-session] (or [profile]) <name> of
       ~/.aws/config and answers the browser half; <name> must have an
       [sso.<name>] table in the config
+  headvpn kibana <name> <path>   [--body file|-] [--config path]
+      logs in to the Kibana app of [kibana.<name>] with SAML and sends
+      GET <path> (read only) through its console proxy; the Elasticsearch
+      response goes to stdout. --body sends a JSON body (e.g. a _search query)
   headvpn secret set <service>/<account>
   headvpn profiles               [--config path]
   headvpn version
@@ -77,6 +81,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	asJSON := fs.Bool("json", false, "machine-readable output")
 	cfgPath := fs.String("config", config.DefaultPath(), "config file")
+	bodyPath := fs.String("body", "", "kibana: JSON body file, or - for stdin")
 	// Allow flags after positional arguments: `connect work --json`.
 	var pos []string
 	for len(rest) > 0 {
@@ -153,6 +158,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 		for _, n := range sortedKeys(cfg.SSO) {
 			fmt.Fprintf(stdout, "%s\taws-sso\t%s\n", n, cfg.SSO[n].IdP)
 		}
+		for _, n := range sortedKeys(cfg.Kibana) {
+			fmt.Fprintf(stdout, "%s\tkibana\t%s\n", n, cfg.Kibana[n].IdP)
+		}
 		return exitOK
 	case "sso":
 		if len(pos) != 1 {
@@ -185,6 +193,30 @@ func run(args []string, stdout, stderr io.Writer) int {
 		default:
 			return exitError
 		}
+	case "kibana":
+		if len(pos) != 2 {
+			fmt.Fprintln(stderr, "usage: headvpn kibana <name> <path> [--body file|-]")
+			return exitUsage
+		}
+		k, ok := cfg.Kibana[pos[0]]
+		if !ok {
+			fmt.Fprintf(stderr, "headvpn: no [kibana.%s] in %s: only the apps listed there can be logged in to\n", pos[0], *cfgPath)
+			return exitUsage
+		}
+		var body []byte
+		if *bodyPath != "" {
+			var err error
+			if *bodyPath == "-" {
+				body, err = io.ReadAll(os.Stdin)
+			} else {
+				body, err = os.ReadFile(*bodyPath)
+			}
+			if err != nil {
+				fmt.Fprintln(stderr, "headvpn:", err)
+				return exitUsage
+			}
+		}
+		return kibanaGet(ctx, k, pos[1], body, deps, stdout, stderr)
 	case "status":
 		names := pos
 		if len(names) == 0 {

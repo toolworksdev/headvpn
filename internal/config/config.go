@@ -4,6 +4,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -140,10 +141,66 @@ func (s SSO) validate() error {
 	return nil
 }
 
+// Kibana is one Kibana / OpenSearch Dashboards app this tool may log in to
+// with SAML, to send read-only requests through its console proxy.
+type Kibana struct {
+	// IdP: only "keycloak" for now — the IdP the Kibana SAML realm trusts.
+	IdP       string `toml:"idp"`
+	IdPOrigin string `toml:"idp_origin"`
+	// URL is the base of the Kibana app, e.g. https://search.example.com/_plugin/kibana
+	URL      string `toml:"url"`
+	Username string `toml:"username"`
+	// Secret references (keychain:, env:, cmd:, prompt:). Never literal values.
+	Password   string `toml:"password"`
+	TOTPSecret string `toml:"totp_secret"`
+	OTP        string `toml:"otp"`
+	// LoginTimeout bounds the login plus the request (default 2m).
+	LoginTimeout duration `toml:"login_timeout"`
+}
+
+// Timeout returns the timeout or a default.
+func (k Kibana) Timeout() time.Duration {
+	if k.LoginTimeout.Duration > 0 {
+		return k.LoginTimeout.Duration
+	}
+	return 2 * time.Minute
+}
+
+// AsProfile exposes the IdP fields with the shape the IdP builders take.
+func (k Kibana) AsProfile() Profile {
+	return Profile{IdP: k.IdP, IdPOrigin: k.IdPOrigin, Username: k.Username,
+		Password: k.Password, TOTPSecret: k.TOTPSecret, OTP: k.OTP}
+}
+
+func (k Kibana) validate() error {
+	switch k.IdP {
+	case "keycloak":
+		if k.IdPOrigin == "" {
+			return errors.New("keycloak needs idp_origin")
+		}
+	case "":
+		return errors.New("idp is required (keycloak)")
+	default:
+		return fmt.Errorf("idp %q is not supported for kibana (keycloak only)", k.IdP)
+	}
+	u, err := url.Parse(k.URL)
+	if k.URL == "" || err != nil || u.Scheme != "https" || u.Host == "" {
+		return errors.New("url must be the https base of the Kibana app")
+	}
+	if k.Username == "" || k.Password == "" {
+		return errors.New("username and password are required")
+	}
+	if k.TOTPSecret != "" && k.OTP != "" {
+		return errors.New("set totp_secret or otp, not both")
+	}
+	return nil
+}
+
 // Config is the whole file.
 type Config struct {
 	Profiles map[string]Profile `toml:"profiles"`
 	SSO      map[string]SSO     `toml:"sso"`
+	Kibana   map[string]Kibana  `toml:"kibana"`
 }
 
 // DefaultPath is $XDG_CONFIG_HOME/headvpn/config.toml or ~/.config/headvpn/config.toml.
@@ -179,6 +236,11 @@ func Load(path string) (*Config, error) {
 	for name, s := range c.SSO {
 		if err := s.validate(); err != nil {
 			return nil, fmt.Errorf("sso %q: %w", name, err)
+		}
+	}
+	for name, k := range c.Kibana {
+		if err := k.validate(); err != nil {
+			return nil, fmt.Errorf("kibana %q: %w", name, err)
 		}
 	}
 	return &c, nil

@@ -171,3 +171,40 @@ func TestSSO(t *testing.T) {
 		}
 	}
 }
+
+const goodKibana = `
+[kibana.search]
+idp = "keycloak"
+idp_origin = "https://idp.example.com"
+url = "https://search.example.com/_plugin/kibana"
+username = "me@example.com"
+password = "keychain:headvpn/search.password"
+totp_secret = "keychain:headvpn/search.totp"
+login_timeout = "30s"
+`
+
+func TestKibana(t *testing.T) {
+	c, err := Load(write(t, goodKibana))
+	if err != nil {
+		t.Fatal(err)
+	}
+	k := c.Kibana["search"]
+	if k.Timeout() != 30*time.Second || k.AsProfile().IdPOrigin != "https://idp.example.com" {
+		t.Fatalf("%+v", k)
+	}
+	bad := map[string]string{
+		"no idp":      strings.Replace(goodKibana, `idp = "keycloak"`, "", 1),
+		"entra":       strings.Replace(goodKibana, `idp = "keycloak"`, `idp = "entra"`, 1),
+		"no origin":   strings.Replace(goodKibana, `idp_origin = "https://idp.example.com"`, "", 1),
+		"http url":    strings.Replace(goodKibana, `url = "https://`, `url = "http://`, 1),
+		"no url":      strings.Replace(goodKibana, `url = "https://search.example.com/_plugin/kibana"`, "", 1),
+		"no password": strings.Replace(goodKibana, `password = "keychain:headvpn/search.password"`, "", 1),
+		"both otp":    goodKibana + `otp = "prompt:"` + "\n",
+		"typo":        goodKibana + `urll = "x"` + "\n",
+	}
+	for name, body := range bad {
+		if _, err := Load(write(t, body)); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}

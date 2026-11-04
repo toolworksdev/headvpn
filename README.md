@@ -270,6 +270,40 @@ is reported only after `aws sts get-caller-identity` accepts the new
 credentials. The sequence was measured on a real portal, both with a client
 that still needs consent and with one that already has it.
 
+## Kibana / OpenSearch Dashboards over SAML (read only)
+
+The same IdP login can open a session in a Kibana (or OpenSearch Dashboards)
+app that authenticates with SAML, and send **read-only** requests through its
+console proxy. Only apps with a `[kibana.NAME]` table can be logged in to:
+
+```toml
+[kibana.search]
+idp         = "keycloak"                                     # keycloak only for now
+idp_origin  = "https://sso.example.com"
+url         = "https://search.example.com/_plugin/kibana"    # base of the Kibana app
+username    = "ana@example.com"
+password    = "keychain:headvpn/search.password"
+totp_secret = "keychain:headvpn/search.totp"
+```
+
+```console
+$ headvpn kibana search _cat/indices?v
+$ headvpn kibana search logs/_count
+$ echo '{"size":5,"query":{"term":{"user_id":"42"}}}' | headvpn kibana search logs/_search --body -
+```
+
+The Elasticsearch response goes to stdout as is; exit 1 when it is not 2xx.
+
+- Every request is proxied as `GET`. The console proxy is a full Elasticsearch
+  client and your role may be allowed to write: this command never asks it to.
+  The restriction lives in headvpn, not in the cluster, so a read-only role is
+  still the right control.
+- The app's SAML login must redirect to `idp_origin`, and the assertion is
+  delivered only to the app's own https origin (unlike the VPN flow, the
+  consumer here is not on loopback).
+- One login per run: each run spends one one-time code. The session cookie is
+  kept in memory only.
+
 ## Usage and contract for agents
 
 ```
