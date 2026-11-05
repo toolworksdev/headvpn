@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/toolworksdev/headvpn/compare/v0.2.0...v0.2.1) (2026-11-05)
+
+
+### Bug Fixes
+
+* 🐛 headvpn sso: follow the sign-in service flow of aws sso login ([487ea50](https://github.com/toolworksdev/headvpn/commit/487ea50edbdd5679fa0c119e6153fc5343610b2a))
+
 ## [0.2.0](https://github.com/toolworksdev/headvpn/compare/v0.1.0...v0.2.0) (2026-11-04)
 
 
