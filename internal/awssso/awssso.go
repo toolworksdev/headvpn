@@ -14,6 +14,7 @@ package awssso
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -49,6 +50,9 @@ type Flow struct {
 	// Loopback delivers the code to the CLI; nil = a client without proxy.
 	Loopback *http.Client
 	IdP      IdP
+	// Username is sent with the consent step of the sign-in service, like
+	// the page does; optional.
+	Username string
 	// Trace, when set, gets one line per request: method, host, path,
 	// status. Never query strings, tokens or form values.
 	Trace func(string)
@@ -114,13 +118,15 @@ func (r *run) run(ctx context.Context, authorizeURL string) error {
 		return fmt.Errorf("%w: the authorize URL must carry client_id, state and a loopback redirect_uri", ErrUnexpected)
 	}
 
-	// 1. authorize → the access portal with callback_url + orchestrator_id.
-	_, at, err := r.walk(ctx, http.MethodGet, authorizeURL, nil, r.isStart)
+	// 1. authorize → either the access portal (callback_url +
+	// orchestrator_id), or — measured 2026-11-05 — straight to the sign-in
+	// service, which answers with the SAML request to the IdP.
+	first, at, err := r.walk(ctx, http.MethodGet, authorizeURL, nil, r.isStart)
 	if err != nil {
 		return err
 	}
 	if at == nil {
-		return fmt.Errorf("%w: authorize did not send us to the access portal", ErrUnexpected)
+		return r.direct(ctx, first, back, state)
 	}
 	orchestrator := at.Query().Get("orchestrator_id")
 	if orchestrator == "" {
@@ -144,36 +150,13 @@ func (r *run) run(ctx context.Context, authorizeURL string) error {
 		return fmt.Errorf("%w: portal login gave no redirectUrl", ErrUnexpected)
 	}
 
-	// 3. The sign-in service answers with an auto-posting SAML request to
-	// the external IdP.
+	// 3-4. The sign-in service hands the SAML request to the IdP, and the
+	// assertion comes back to the sign-in service.
 	page, _, err := r.walk(ctx, http.MethodGet, login.RedirectURL, nil, nil)
 	if err != nil {
 		return err
 	}
-	req, ok := formWith(page.html, "SAMLRequest")
-	if !ok {
-		return fmt.Errorf("%w: the sign-in page holds no SAML request (HTTP %d %s) — is the directory federated with an external IdP?", ErrUnexpected, page.status, page.url.Host+page.url.Path)
-	}
-	idpAction, err := page.url.Parse(req.Action)
-	if err != nil || idpAction.Scheme != "https" {
-		return fmt.Errorf("%w: SAML request action is not https", ErrUnexpected)
-	}
-
-	// 4. The IdP signs in and returns the SAML response, which must go back
-	// to this region's sign-in service and nowhere else.
-	resp, err := r.IdP(ctx, idpAction.String(), req.Values())
-	if err != nil {
-		return err
-	}
-	acs, err := url.Parse(resp.Action)
-	if err != nil || acs.Scheme != "https" || !r.isSignin(acs) {
-		return fmt.Errorf("refusing to send the SAML assertion to %q: not the AWS sign-in service of %s", redact(resp.Action), r.Region)
-	}
-	vals := url.Values{"SAMLResponse": {resp.SAMLResponse}}
-	if resp.RelayState != "" {
-		vals.Set("RelayState", resp.RelayState)
-	}
-	page, at, err = r.walk(ctx, http.MethodPost, acs.String(), vals, r.isStart)
+	page, at, err = r.assert(ctx, page, r.isStart)
 	if err != nil {
 		return err
 	}
@@ -289,6 +272,96 @@ func (r *run) finish(ctx context.Context, code, back *url.URL, state string) err
 		return fmt.Errorf("%w: callback without code or with another state", ErrUnexpected)
 	}
 	return r.deliver(ctx, code.String())
+}
+
+// assert takes the sign-in page that auto-posts a SAML request, signs in at
+// the IdP, and posts the assertion back to this region's sign-in service and
+// nowhere else. It follows the answer until stop accepts a location.
+func (r *run) assert(ctx context.Context, page *page, stop func(*url.URL) bool) (*page, *url.URL, error) {
+	req, ok := formWith(page.html, "SAMLRequest")
+	if !ok {
+		return nil, nil, fmt.Errorf("%w: the sign-in page holds no SAML request (HTTP %d %s) — is the directory federated with an external IdP?", ErrUnexpected, page.status, page.url.Host+page.url.Path)
+	}
+	idpAction, err := page.url.Parse(req.Action)
+	if err != nil || idpAction.Scheme != "https" {
+		return nil, nil, fmt.Errorf("%w: SAML request action is not https", ErrUnexpected)
+	}
+	resp, err := r.IdP(ctx, idpAction.String(), req.Values())
+	if err != nil {
+		return nil, nil, err
+	}
+	acs, err := url.Parse(resp.Action)
+	if err != nil || acs.Scheme != "https" || !r.isSignin(acs) {
+		return nil, nil, fmt.Errorf("refusing to send the SAML assertion to %q: not the AWS sign-in service of %s", redact(resp.Action), r.Region)
+	}
+	vals := url.Values{"SAMLResponse": {resp.SAMLResponse}}
+	if resp.RelayState != "" {
+		vals.Set("RelayState", resp.RelayState)
+	}
+	return r.walk(ctx, http.MethodPost, acs.String(), vals, stop)
+}
+
+// direct is the flow measured on 2026-11-05: OIDC sends the browser to the
+// sign-in service, which takes the SAML assertion and redirects straight to
+// the CLI's loopback — or, when the client still needs consent, to its own
+// page, whose "Allow access" is one workflow call (api/execute).
+func (r *run) direct(ctx context.Context, page *page, back *url.URL, state string) error {
+	if page == nil || !r.isSignin(page.url) {
+		return fmt.Errorf("%w: authorize led neither to the access portal nor to the sign-in service", ErrUnexpected)
+	}
+	isBack := func(u *url.URL) bool { return u.Scheme == "http" && loopback(u.Hostname()) }
+	page, code, err := r.assert(ctx, page, isBack)
+	if err != nil {
+		return err
+	}
+	if code != nil {
+		r.trace("consent already given to this client")
+		return r.finish(ctx, code, back, state)
+	}
+	wsh := page.url.Query().Get("workflowStateHandle")
+	if !r.isSignin(page.url) || !strings.HasSuffix(page.url.Path, "/login") || wsh == "" {
+		return fmt.Errorf("%w: after the IdP the sign-in service answered HTTP %d %s", ErrUnexpected, page.status, page.url.Host+page.url.Path)
+	}
+	execURL := "https://" + page.url.Host + strings.TrimSuffix(page.url.Path, "/login") + "/api/execute"
+	inputs := []map[string]string{}
+	if r.Username != "" {
+		inputs = append(inputs, map[string]string{"input_type": "UserRequestInput", "username": r.Username})
+	}
+	var out struct {
+		StepID   string `json:"stepId"`
+		Redirect struct {
+			URL string `json:"url"`
+		} `json:"redirect"`
+	}
+	hdr := http.Header{
+		"Origin":           {"https://" + page.url.Host},
+		"Referer":          {page.url.String()},
+		"x-amzn-requestid": {uuid4()},
+		"X-Amz-Date":       {time.Now().UTC().Format(http.TimeFormat)},
+	}
+	if err := r.json(ctx, http.MethodPost, execURL, map[string]any{
+		"stepId": "get-user-consent", "workflowStateHandle": wsh, "startWorkflowHandle": wsh,
+		"actionId": "SUBMIT", "inputs": inputs, "requestId": uuid4(),
+	}, hdr, &out); err != nil {
+		return err
+	}
+	r.trace("consent: " + out.StepID)
+	if out.StepID != "end-of-workflow-success" || out.Redirect.URL == "" {
+		return fmt.Errorf("%w: consent ended at step %q", ErrUnexpected, out.StepID)
+	}
+	code, err = url.Parse(out.Redirect.URL)
+	if err != nil || !isBack(code) {
+		return fmt.Errorf("refusing to follow the consent to %q: not the CLI's loopback", redact(out.Redirect.URL))
+	}
+	return r.finish(ctx, code, back, state)
+}
+
+func uuid4() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	b[6] = b[6]&0x0f | 0x40
+	b[8] = b[8]&0x3f | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
 }
 
 func (r *run) isStart(u *url.URL) bool {
@@ -421,8 +494,12 @@ func (r *run) api(req *http.Request, hdr http.Header, out any) error {
 		req.Header[k] = v // keep the exact header names the portal uses
 	}
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Origin", "https://"+r.start.Host)
-	req.Header.Set("Referer", r.start.String())
+	if req.Header.Get("Origin") == "" {
+		req.Header.Set("Origin", "https://"+r.start.Host)
+	}
+	if req.Header.Get("Referer") == "" {
+		req.Header.Set("Referer", r.start.String())
+	}
 	p, _, err := r.do(req)
 	if err != nil {
 		return err

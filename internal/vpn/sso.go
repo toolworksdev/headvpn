@@ -105,7 +105,7 @@ func SSOLogin(ctx context.Context, name string, s config.SSO, d SSODeps) (SSORes
 	done := make(chan string, 1)
 	go func() { b, _ := io.ReadAll(rest); done <- string(b) }()
 
-	flow := &awssso.Flow{StartURL: t.StartURL, Region: t.Region, IdP: idp, Client: d.HTTP}
+	flow := &awssso.Flow{StartURL: t.StartURL, Region: t.Region, IdP: idp, Client: d.HTTP, Username: s.Username}
 	if flow.Client == nil {
 		jar, _ := cookiejar.New(nil)
 		flow.Client = &http.Client{Jar: jar, Timeout: 30 * time.Second}

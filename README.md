@@ -36,7 +36,7 @@ IdP over plain HTTP and hands the assertion to the client's local consumer.
 | Backend `pritunl`: the official Pritunl client CLI (macOS, Linux) | implemented |
 | IdP `entra`: Microsoft Entra ID, password + TOTP (with `pritunl`) | implemented |
 | `headvpn sso`: answers `aws sso login` (IAM Identity Center federated by SAML) with `keycloak` | implemented, validated on a real portal |
-| `headvpn sso` with `entra` | implemented, tested against a simulated portal and IdP only |
+| `headvpn sso` with `entra` | implemented, validated on a real portal |
 | Secrets in the macOS Keychain / Linux Secret Service / `env:` / `cmd:` | implemented |
 | Windows | not yet (see *Roadmap*) |
 | Okta | not yet |
@@ -262,13 +262,21 @@ $ headvpn sso work --json
 ```
 
 `headvpn sso` runs the official `aws sso login … --no-browser` (authorization
-code with PKCE), reads the authorize URL it prints, and walks the same requests
-the access portal's page makes: portal → sign-in service → the IdP (SAML
-POST binding) → back to the portal → OIDC → the "Allow access" consent →
-the CLI's loopback port. The token cache is written by the CLI itself. Success
-is reported only after `aws sts get-caller-identity` accepts the new
-credentials. The sequence was measured on a real portal, both with a client
-that still needs consent and with one that already has it.
+code with PKCE), reads the authorize URL it prints, and makes the same requests
+the AWS sign-in pages make. AWS serves two flows, and which one a directory gets
+is AWS's choice (both were measured in November 2026, on two directories at the
+same time):
+
+- **Sign-in service:** authorize → `signin.aws` → the IdP (SAML POST binding)
+  → back to `signin.aws`, which redirects straight to the CLI's loopback port;
+  when the client still needs consent, "Allow access" is one workflow call.
+- **Access portal:** authorize → the access portal → `signin.aws` → the IdP →
+  the portal → OIDC → the "Allow access" consent → the CLI's loopback port.
+
+The token cache is written by the CLI itself. Success is reported only after
+`aws sts get-caller-identity` accepts the new credentials. Both flows were
+measured on real directories with a client that still needs consent and with one
+that already has it.
 
 ## Kibana / OpenSearch Dashboards over SAML (read only)
 

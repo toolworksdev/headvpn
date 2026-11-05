@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/cookiejar"
@@ -33,6 +34,9 @@ type fakeAWS struct {
 	consentFor string // clientId the consent screen shows
 	acsRedir   string // where the ACS sends the browser after the IdP
 	backTo     string // where authorize finally sends the code (default: cb)
+	direct     bool   // the 2026-11 flow: authorize → sign-in service, no portal
+	execTo     string // where the consent step redirects (default: cb)
+	execBody   map[string]any
 }
 
 const (
@@ -123,7 +127,36 @@ func (f *fakeAWS) serve(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, "https://example.awsapps.com/start/?clientId="+f.consentFor+"&clientType=PUBLIC&authorizationResumptionContext=ARC", http.StatusFound)
 			return
 		}
+		if f.direct {
+			http.Redirect(w, r, "https://"+region+".signin.aws/platform/authorize?callback_url=x&request_uri=RU&identitystore_id=d-1", http.StatusFound)
+			return
+		}
 		http.Redirect(w, r, "https://example.awsapps.com/start/?callback_url=x&orchestrator_id=ORCH", http.StatusFound)
+	case region + ".signin.aws/platform/authorize":
+		if q.Get("request_uri") != "RU" {
+			http.Error(w, "bad request_uri", http.StatusBadRequest)
+			return
+		}
+		http.Redirect(w, r, "/platform/d-1/login?request_uri=RU", http.StatusFound)
+	case region + ".signin.aws/platform/d-1/api/execute":
+		var b map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&b)
+		f.mu.Lock()
+		f.execBody = b
+		f.mu.Unlock()
+		if b["stepId"] != "get-user-consent" || b["actionId"] != "SUBMIT" || b["workflowStateHandle"] != "WC" || b["startWorkflowHandle"] != "WC" {
+			// A failed step still carries a redirect: only the step says it worked.
+			writeJSON(w, map[string]any{"stepId": "error", "redirect": map[string]string{"url": f.cb.URL + "/oauth/callback?code=CODE&state=" + state}})
+			return
+		}
+		f.mu.Lock()
+		f.consented = true
+		f.mu.Unlock()
+		to := f.execTo
+		if to == "" {
+			to = f.cb.URL + "/oauth/callback?code=CODE&state=" + state
+		}
+		writeJSON(w, map[string]any{"stepId": "end-of-workflow-success", "redirect": map[string]string{"url": to, "method": "GET"}})
 	case portal + "/login":
 		if q.Get("directory_id") != "example" || !strings.Contains(q.Get("redirect_url"), "orchestrator_id=ORCH") {
 			http.Error(w, "bad login", http.StatusBadRequest)
@@ -131,7 +164,15 @@ func (f *fakeAWS) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, map[string]string{"redirectUrl": "https://" + region + ".signin.aws/platform/d-1/login?workflowStateHandle=W&shouldRedirect=true", "csrfToken": "CSRF"})
 	case region + ".signin.aws/platform/d-1/login":
+		if q.Get("request_uri") == "RU" {
+			http.Redirect(w, r, "/platform/d-1/login?workflowStateHandle=W&shouldRedirect=true", http.StatusFound)
+			return
+		}
 		w.Header().Set("Content-Type", "text/html;charset=UTF-8")
+		if q.Get("workflowStateHandle") == "WC" {
+			fmt.Fprint(w, `<!DOCTYPE html><html><head><title>Amazon Web Services</title></head><body><div id="root"></div></body></html>`)
+			return
+		}
 		fmt.Fprint(w, `<html><body><form id='postForm' method='POST' action='https://idp.example.com/saml'><input type='hidden' name='SAMLRequest' value='REQ'/><input type='hidden' name='RelayState' value='RS'/></form><script>document.getElementById('postForm').submit();</script></body></html>`)
 	case region + ".signin.aws.amazon.com/platform/saml/acs/1":
 		http.Redirect(w, r, "https://"+region+".signin.aws/platform/saml/acs/1", http.StatusTemporaryRedirect)
@@ -141,6 +182,14 @@ func (f *fakeAWS) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		to := f.acsRedir
+		if to == "" && f.direct {
+			if consented {
+				http.Redirect(w, r, f.cb.URL+"/oauth/callback?code=CODE&state="+state, http.StatusFound)
+				return
+			}
+			http.Redirect(w, r, "/platform/d-1/login?workflowStateHandle=WC", http.StatusSeeOther)
+			return
+		}
 		if to == "" {
 			to = "https://example.awsapps.com/start/?state=ST&workflowResultHandle=WR&wdc_csrf_token=W"
 		}
@@ -329,5 +378,140 @@ func TestRefusesCallbackWithAnotherState(t *testing.T) {
 	}
 	if f.gotCode != "" {
 		t.Fatal("callback reached")
+	}
+}
+
+func (f *fakeAWS) directFlow(acs string, calls *int) *Flow {
+	fl := f.flow(acs, calls)
+	fl.Username = "ana@example.com"
+	return fl
+}
+
+func TestDirectFlowWithConsent(t *testing.T) {
+	f := newFake(t)
+	f.direct = true
+	var calls int
+	if err := f.directFlow(goodACS, &calls).Run(context.Background(), f.authorizeURL()); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 || f.gotCode != "CODE" || f.gotState != state {
+		t.Fatalf("idp calls %d, callback code %q state %q", calls, f.gotCode, f.gotState)
+	}
+	if n := f.count(region + ".signin.aws/platform/d-1/api/execute"); n != 1 {
+		t.Fatalf("consent step called %d times, want 1", n)
+	}
+	in, _ := f.execBody["inputs"].([]any)
+	if len(in) != 1 || in[0].(map[string]any)["username"] != "ana@example.com" {
+		t.Fatalf("consent inputs %v", f.execBody["inputs"])
+	}
+	if n := f.hostHits("example.awsapps.com") + f.hostHits("portal.sso."+region+".amazonaws.com"); n != 0 {
+		t.Fatalf("the direct flow went through the portal (%d requests)", n)
+	}
+}
+
+func TestDirectFlowAlreadyConsented(t *testing.T) {
+	f := newFake(t)
+	f.direct, f.consented = true, true
+	var calls int
+	if err := f.directFlow(goodACS, &calls).Run(context.Background(), f.authorizeURL()); err != nil {
+		t.Fatal(err)
+	}
+	if f.gotCode != "CODE" {
+		t.Fatalf("callback code %q", f.gotCode)
+	}
+	if n := f.count(region + ".signin.aws/platform/d-1/api/execute"); n != 0 {
+		t.Fatalf("approved consent %d times on an already-consented client", n)
+	}
+}
+
+func TestDirectFlowRefusesAssertionForAnotherHost(t *testing.T) {
+	f := newFake(t)
+	f.direct = true
+	var calls int
+	err := f.directFlow("https://evil.example.net/acs", &calls).Run(context.Background(), f.authorizeURL())
+	if err == nil || !strings.Contains(err.Error(), "refusing to send the SAML assertion") {
+		t.Fatalf("err = %v", err)
+	}
+	if n := f.hostHits("evil.example.net"); n != 0 {
+		t.Fatalf("the assertion reached the untrusted host (%d requests)", n)
+	}
+}
+
+func TestDirectFlowRefusesConsentRedirectOffLoopback(t *testing.T) {
+	f := newFake(t)
+	f.direct = true
+	f.execTo = "https://evil.example.net/oauth/callback?code=CODE&state=" + state
+	var calls int
+	err := f.directFlow(goodACS, &calls).Run(context.Background(), f.authorizeURL())
+	if err == nil || !strings.Contains(err.Error(), "not the CLI's loopback") {
+		t.Fatalf("err = %v", err)
+	}
+	if n := f.hostHits("evil.example.net"); n != 0 {
+		t.Fatalf("followed the consent off the machine (%d requests)", n)
+	}
+}
+
+func TestDirectFlowRefusesCodeForAnotherPort(t *testing.T) {
+	f := newFake(t)
+	f.direct = true
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("the code reached a loopback port the CLI does not listen on")
+	}))
+	defer other.Close()
+	f.execTo = other.URL + "/oauth/callback?code=CODE&state=" + state
+	var calls int
+	err := f.directFlow(goodACS, &calls).Run(context.Background(), f.authorizeURL())
+	if err == nil || !strings.Contains(err.Error(), "refusing to deliver the code") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestDirectFlowRejectsAFailedConsent(t *testing.T) {
+	f := newFake(t)
+	f.direct = true
+	var calls int
+	fl := f.directFlow(goodACS, &calls)
+	// A consent for another workflow handle: the fake answers a non-final step.
+	fl.Client.Transport = rewriteBody(fl.Client.Transport, `"WC"`, `"XX"`)
+	err := fl.Run(context.Background(), f.authorizeURL())
+	if err == nil || !strings.Contains(err.Error(), "consent ended at step") {
+		t.Fatalf("err = %v", err)
+	}
+	if f.gotCode != "" {
+		t.Fatal("callback reached")
+	}
+}
+
+type rewriter struct {
+	rt       http.RoundTripper
+	old, new string
+}
+
+func rewriteBody(rt http.RoundTripper, old, new string) http.RoundTripper {
+	return &rewriter{rt, old, new}
+}
+
+func (w *rewriter) RoundTrip(r *http.Request) (*http.Response, error) {
+	if strings.HasSuffix(r.URL.Path, "/api/execute") && r.Body != nil {
+		b, _ := io.ReadAll(r.Body)
+		nb := strings.ReplaceAll(string(b), w.old, w.new)
+		r.Body = io.NopCloser(strings.NewReader(nb))
+		r.ContentLength = int64(len(nb))
+	}
+	return w.rt.RoundTrip(r)
+}
+
+func TestDirectFlowConsentedRefusesCodeForAnotherPort(t *testing.T) {
+	f := newFake(t)
+	f.direct = true
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("the code reached a loopback port the CLI does not listen on")
+	}))
+	defer other.Close()
+	f.acsRedir = other.URL + "/oauth/callback?code=CODE&state=" + state
+	var calls int
+	err := f.directFlow(goodACS, &calls).Run(context.Background(), f.authorizeURL())
+	if err == nil || !strings.Contains(err.Error(), "refusing to deliver the code") {
+		t.Fatalf("err = %v", err)
 	}
 }
