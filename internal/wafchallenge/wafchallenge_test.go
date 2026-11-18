@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -169,7 +170,8 @@ func TestTokenIsCachedOnDiskForTheNextRun(t *testing.T) {
 	if len(files) != 1 {
 		t.Fatalf("cache files %v", files)
 	}
-	if st, _ := os.Stat(files[0]); st.Mode().Perm() != 0o600 {
+	// Windows has no Unix permission bits; elsewhere the token file is private.
+	if st, _ := os.Stat(files[0]); runtime.GOOS != "windows" && st.Mode().Perm() != 0o600 {
 		t.Fatalf("cache file mode %v", st.Mode().Perm())
 	}
 }
