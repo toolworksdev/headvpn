@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.2](https://github.com/toolworksdev/headvpn/compare/v0.2.1...v0.2.2) (2026-11-18)
+
+
+### Bug Fixes
+
+* 🐛 answer the AWS WAF challenge in front of the IdP with a headless browser ([1468bb9](https://github.com/toolworksdev/headvpn/commit/1468bb919400492fe450084fa77a8863f5973ecd))
+
 ## [0.2.1](https://github.com/toolworksdev/headvpn/compare/v0.2.0...v0.2.1) (2026-11-05)
 
 
