@@ -15,6 +15,7 @@ import (
 
 	"github.com/toolworksdev/headvpn/internal/htmlform"
 	"github.com/toolworksdev/headvpn/internal/saml"
+	"github.com/toolworksdev/headvpn/internal/wafchallenge"
 )
 
 // ErrRejected means Keycloak answered the credentials with an error message.
@@ -37,6 +38,11 @@ type Login struct {
 	Client *http.Client
 	// MaxSteps bounds the number of pages walked (default 6).
 	MaxSteps int
+	// WAF answers an AWS WAF Challenge in front of the realm (any step);
+	// nil = such a page fails with wafchallenge.ErrUnsolved.
+	WAF wafchallenge.Solver
+	// WAFCache keeps the aws-waf-token between runs; nil = memory only.
+	WAFCache *wafchallenge.Cache
 }
 
 // Run starts at samlURL and returns the SAML POST form for the VPN client.
@@ -74,6 +80,13 @@ func (l *Login) run(ctx context.Context, method, samlURL string, first url.Value
 			return errors.New("too many redirects")
 		}
 		return sameOrigin(origin, req.URL.String())
+	}
+	if l.WAF != nil {
+		if guarded.Jar == nil {
+			jar, _ := cookiejar.New(nil)
+			guarded.Jar = jar
+		}
+		guarded.Transport = &wafchallenge.Transport{Base: client.Transport, Jar: guarded.Jar, Solver: l.WAF, Cache: l.WAFCache}
 	}
 
 	steps := l.MaxSteps
@@ -200,6 +213,10 @@ func fetch(ctx context.Context, c *http.Client, method, target string, form url.
 		return nil, nil, err
 	}
 	defer resp.Body.Close()
+	if wafchallenge.IsChallenge(resp) {
+		// 202 with an empty body is not a page: it is AWS WAF asking for a browser.
+		return nil, nil, fmt.Errorf("%w: %s %s", wafchallenge.ErrUnsolved, method, redactQuery(target))
+	}
 	if resp.StatusCode >= 500 {
 		return nil, nil, fmt.Errorf("%s %s: HTTP %d", method, redactQuery(target), resp.StatusCode)
 	}

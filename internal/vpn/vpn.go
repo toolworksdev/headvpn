@@ -21,6 +21,7 @@ import (
 	"github.com/toolworksdev/headvpn/internal/idp/keycloak"
 	"github.com/toolworksdev/headvpn/internal/secret"
 	"github.com/toolworksdev/headvpn/internal/totp"
+	"github.com/toolworksdev/headvpn/internal/wafchallenge"
 )
 
 // Result is what connect/status/disconnect report.
@@ -58,9 +59,13 @@ type Deps struct {
 	// the instant the client spends launching the browser.
 	FindURL func(ctx context.Context, origin string, since time.Time) (string, error)
 	HTTP    *http.Client // IdP traffic; nil = default with cookie jar
-	Deliver *http.Client // loopback POST of the assertion
-	Now     func() time.Time
-	Poll    time.Duration
+	// WAF solves an AWS WAF Challenge in front of the IdP; nil = fail with
+	// wafchallenge.ErrUnsolved. WAFCache keeps the token between runs.
+	WAF      wafchallenge.Solver
+	WAFCache *wafchallenge.Cache
+	Deliver  *http.Client // loopback POST of the assertion
+	Now      func() time.Time
+	Poll     time.Duration
 	// CheckOS rejects platforms the backend does not support; nil skips it.
 	CheckOS func() error
 	// ConfigPath is handed to the root supervisor of the aws-openvpn backend.
@@ -91,6 +96,13 @@ func Default(prompt secret.Prompter) Deps {
 			)
 		},
 		Deliver: &http.Client{Timeout: 15 * time.Second},
+		WAF:     &wafchallenge.Browser{},
+		WAFCache: func() *wafchallenge.Cache {
+			if c, err := os.UserCacheDir(); err == nil {
+				return &wafchallenge.Cache{Dir: filepath.Join(c, "headvpn")}
+			}
+			return &wafchallenge.Cache{}
+		}(),
 		Pritunl: func(p config.Profile) PritunlCLI { return pritunl.New(p.PritunlCLI) },
 		TOTPState: func() string {
 			if c, err := os.UserCacheDir(); err == nil {
@@ -274,7 +286,8 @@ func buildLogin(ctx context.Context, p config.Profile, d Deps) (*keycloak.Login,
 	if err != nil {
 		return nil, err
 	}
-	l := &keycloak.Login{Origin: p.IdPOrigin, Username: p.Username, Password: pw, Client: d.HTTP}
+	l := &keycloak.Login{Origin: p.IdPOrigin, Username: p.Username, Password: pw, Client: d.HTTP,
+		WAF: d.WAF, WAFCache: d.WAFCache}
 	if l.OTP, err = otpFunc(ctx, p, d); err != nil {
 		return nil, err
 	}

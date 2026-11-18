@@ -9,6 +9,8 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -16,12 +18,15 @@ import (
 	"runtime/debug"
 	"sort"
 	"strings"
+	"time"
 
 	"golang.org/x/term"
 
 	"github.com/toolworksdev/headvpn/internal/config"
+	"github.com/toolworksdev/headvpn/internal/htmlform"
 	"github.com/toolworksdev/headvpn/internal/secret"
 	"github.com/toolworksdev/headvpn/internal/vpn"
+	"github.com/toolworksdev/headvpn/internal/wafchallenge"
 )
 
 // version is set at build time with -ldflags "-X main.version=...".
@@ -53,6 +58,7 @@ const usage = `headvpn — connect a VPN without a human at the browser
 Usage:
   headvpn connect <profile>      [--json] [--config path]
   headvpn status [<profile>]     [--json] [--config path]
+  headvpn waf-check <https-url>  (is an AWS WAF Challenge in the way? never prints the token)
   headvpn disconnect <profile>   [--json] [--config path]
   headvpn sso <name>             [--json] [--config path]
       runs ` + "`aws sso login`" + ` for the [sso-session] (or [profile]) <name> of
@@ -112,6 +118,19 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return exitUsage
 		}
 		if err := vpn.Supervise(pos[0], os.Stdin); err != nil {
+			fmt.Fprintln(stderr, "headvpn:", err)
+			return exitError
+		}
+		return exitOK
+	case "waf-check":
+		// Diagnostic: does an AWS WAF Challenge stand in front of this URL,
+		// and can the headless browser get past it? Sends no credentials and
+		// never prints the token.
+		if len(pos) != 1 {
+			fmt.Fprintln(stderr, "usage: headvpn waf-check <https-url>")
+			return exitUsage
+		}
+		if err := wafCheck(context.Background(), pos[0], stdout); err != nil {
 			fmt.Fprintln(stderr, "headvpn:", err)
 			return exitError
 		}
@@ -358,4 +377,53 @@ func firstOr(s []string, def string) string {
 		return s[0]
 	}
 	return def
+}
+
+func wafCheck(ctx context.Context, target string, w io.Writer) error {
+	u, err := url.Parse(target)
+	if err != nil || u.Scheme != "https" || u.Host == "" {
+		return fmt.Errorf("waf-check needs an https URL, got %q", target)
+	}
+	show := u.Host + u.Path
+	get := func(c *http.Client) (*http.Response, *htmlform.Page, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+		if err != nil {
+			return nil, nil, err
+		}
+		req.Header.Set("Accept", "text/html")
+		resp, err := c.Do(req)
+		if err != nil {
+			return nil, nil, err
+		}
+		defer resp.Body.Close()
+		page, err := htmlform.Parse(io.LimitReader(resp.Body, 4<<20))
+		return resp, page, err
+	}
+	describe := func(label string, resp *http.Response, page *htmlform.Page) {
+		var forms []string
+		for _, f := range page.Forms {
+			forms = append(forms, firstOr([]string{f.ID}, "?"))
+		}
+		end := resp.Request.URL
+		fmt.Fprintf(w, "%s: GET %s -> %d at %s x-amzn-waf-action=%q title=%q forms=%v\n", label, show,
+			resp.StatusCode, end.Host+end.Path, resp.Header.Get("x-amzn-waf-action"), page.Title, forms)
+	}
+	plain := &http.Client{Timeout: 30 * time.Second}
+	resp, page, err := get(plain)
+	if err != nil {
+		return err
+	}
+	describe("without token", resp, page)
+	if !wafchallenge.IsChallenge(resp) {
+		fmt.Fprintln(w, "no WAF challenge for this URL from this address")
+		return nil
+	}
+	start := time.Now()
+	c := wafchallenge.Wrap(plain, &wafchallenge.Browser{}, &wafchallenge.Cache{})
+	resp, page, err = get(c)
+	if err != nil {
+		return err
+	}
+	describe(fmt.Sprintf("with token (%.1fs)", time.Since(start).Seconds()), resp, page)
+	return nil
 }
