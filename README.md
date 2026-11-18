@@ -395,6 +395,32 @@ ssh mac '~/.local/bin/headvpn disconnect work'
 
 The user must be logged in to the GUI session (a locked screen is fine).
 
+## AWS WAF Challenge in front of the IdP
+
+Some IdPs sit behind an AWS WAF WebACL whose `Challenge` rule exempts only a
+few addresses (for example the VPN egress IPs). From any other address the IdP
+answers `202` with `x-amzn-waf-action: challenge` and an empty body; only a
+browser can run the interstitial's JavaScript. When the VPN is down that is a
+loop: the challenge stands in front of the login that brings the VPN up.
+
+The Keycloak login (`connect` and `sso`) detects that answer on every step,
+loads the same path (without its query string) in a throwaway headless
+Chrome/Brave/Chromium/Edge profile driven over `--remote-debugging-pipe`,
+takes the `aws-waf-token` cookie for that host, keeps it until it expires
+(memory plus a `0600` file under the user cache directory, `headvpn/`) and
+replays the original request once with the token in the client's cookie jar.
+The browser never receives credentials. If no browser is found or it does not
+get a token, the login fails with `WAF challenge sin resolver` instead of the
+generic "page this tool does not know how to answer".
+
+- `HEADVPN_BROWSER=/path/to/chrome` picks the browser (default: the first of
+  Chrome, Brave, Chromium, Edge).
+- `HEADVPN_BROWSER_FLAGS="--no-sandbox"` adds flags; an unpacked Chrome (not
+  the `.deb`) on Ubuntu 23.10+ needs it because AppArmor blocks its sandbox.
+- `headvpn waf-check <https-url>` shows whether a URL is challenged from this
+  address and whether the browser gets past it (status, title and form ids;
+  never the token, never credentials).
+
 ## Security model
 
 Read this before you give an agent your VPN.
